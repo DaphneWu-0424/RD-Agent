@@ -1,11 +1,11 @@
 import json
 import re
 import time
+from enum import Enum
 from pathlib import Path
 
 from rdagent.components.coder.CoSTEER.evaluators import (
     CoSTEEREvaluator,
-    CoSTEERMultiFeedback,
     CoSTEERSingleFeedbackDeprecated,
 )
 from rdagent.components.coder.factor_coder.config import FACTOR_COSTEER_SETTINGS
@@ -20,6 +20,37 @@ from rdagent.core.experiment import Workspace
 from rdagent.log import rdagent_logger as logger
 
 FactorSingleFeedback = CoSTEERSingleFeedbackDeprecated
+
+
+class FactorGateDecision(str, Enum):
+    """Research permission granted by the implementation gates."""
+
+    REJECT = "REJECT"
+    SMOKE_ONLY = "SMOKE_ONLY"
+    FULL_READY = "FULL_READY"
+
+
+def get_factor_gate_decision(feedback: FactorSingleFeedback | None) -> FactorGateDecision:
+    """Translate merged functional/performance feedback into a research permission."""
+    if feedback is None:
+        return FactorGateDecision.REJECT
+    sources = feedback.source_feedback
+    if sources.get("correctness") is not True or sources.get("schema") is not True:
+        return FactorGateDecision.REJECT
+    if sources.get("performance") is True:
+        return FactorGateDecision.FULL_READY
+    performance_feedback = "\n".join(
+        str(value or "")
+        for value in (
+            feedback.execution,
+            feedback.return_checking,
+            feedback.code,
+            getattr(feedback, "final_feedback", None),
+        )
+    )
+    if sources.get("performance") is False and "failure_type=PROJECTED_RUNTIME_EXCEEDED" in performance_feedback:
+        return FactorGateDecision.SMOKE_ONLY
+    return FactorGateDecision.REJECT
 
 
 class FactorEvaluatorForCoder(CoSTEEREvaluator):
@@ -50,8 +81,8 @@ class FactorEvaluatorForCoder(CoSTEEREvaluator):
             and target_task_information in queried_knowledge.success_task_to_knowledge_dict
         ):
             return queried_knowledge.success_task_to_knowledge_dict[target_task_information].feedback
-        elif queried_knowledge is not None and target_task_information in queried_knowledge.failed_task_info_set:
-            return FactorSingleFeedback(
+        if queried_knowledge is not None and target_task_information in queried_knowledge.failed_task_info_set:
+            feedback = FactorSingleFeedback(
                 execution_feedback="This task has failed too many times, skip implementation.",
                 value_generated_flag=False,
                 code_feedback="This task has failed too many times, skip code evaluation.",
@@ -60,69 +91,76 @@ class FactorEvaluatorForCoder(CoSTEEREvaluator):
                 final_feedback="This task has failed too many times, skip final decision evaluation.",
                 final_decision_based_on_gt=False,
             )
+            feedback.source_feedback.update({"correctness": False, "schema": False})
+            return feedback
+        factor_feedback = FactorSingleFeedback()
+
+        # 1. Get factor execution feedback to generated implementation and remove the long list of numbers in execution feedback
+        (
+            execution_feedback,
+            gen_df,
+        ) = implementation.execute()
+
+        execution_feedback = re.sub(r"(?<=\D)(,\s+-?\d+\.\d+){50,}(?=\D)", ", ", execution_feedback)
+        factor_feedback.execution_feedback = "\n".join(
+            [line for line in execution_feedback.split("\n") if "warning" not in line.lower()],
+        )
+
+        # 2. Get factor value feedback
+        if gen_df is None:
+            factor_feedback.value_feedback = "No factor value generated, skip value evaluation."
+            factor_feedback.value_generated_flag = False
+            decision_from_value_check = None
         else:
-            factor_feedback = FactorSingleFeedback()
-
-            # 1. Get factor execution feedback to generated implementation and remove the long list of numbers in execution feedback
+            factor_feedback.value_generated_flag = True
             (
-                execution_feedback,
-                gen_df,
-            ) = implementation.execute()
-
-            execution_feedback = re.sub(r"(?<=\D)(,\s+-?\d+\.\d+){50,}(?=\D)", ", ", execution_feedback)
-            factor_feedback.execution_feedback = "\n".join(
-                [line for line in execution_feedback.split("\n") if "warning" not in line.lower()]
+                factor_feedback.value_feedback,
+                decision_from_value_check,
+            ) = self.value_evaluator.evaluate(
+                implementation=implementation, gt_implementation=gt_implementation, version=target_task.version,
             )
 
-            # 2. Get factor value feedback
-            if gen_df is None:
-                factor_feedback.value_feedback = "No factor value generated, skip value evaluation."
-                factor_feedback.value_generated_flag = False
-                decision_from_value_check = None
-            else:
-                factor_feedback.value_generated_flag = True
-                (
-                    factor_feedback.value_feedback,
-                    decision_from_value_check,
-                ) = self.value_evaluator.evaluate(
-                    implementation=implementation, gt_implementation=gt_implementation, version=target_task.version
-                )
+        factor_feedback.final_decision_based_on_gt = gt_implementation is not None
 
-            factor_feedback.final_decision_based_on_gt = gt_implementation is not None
-
-            if decision_from_value_check is not None and decision_from_value_check is True:
-                # To avoid confusion, when same_value_or_high_correlation is True, we do not need code feedback
-                factor_feedback.code_feedback = "Final decision is True and there are no code critics."
-                factor_feedback.final_decision = decision_from_value_check
-                factor_feedback.final_feedback = "Value evaluation passed, skip final decision evaluation."
-            elif decision_from_value_check is not None and decision_from_value_check is False:
-                factor_feedback.code_feedback, _ = self.code_evaluator.evaluate(
-                    target_task=target_task,
-                    implementation=implementation,
-                    execution_feedback=factor_feedback.execution_feedback,
-                    value_feedback=factor_feedback.value_feedback,
-                    gt_implementation=gt_implementation,
-                )
-                factor_feedback.final_decision = decision_from_value_check
-                factor_feedback.final_feedback = "Value evaluation failed, skip final decision evaluation."
-            else:
-                factor_feedback.code_feedback, _ = self.code_evaluator.evaluate(
-                    target_task=target_task,
-                    implementation=implementation,
-                    execution_feedback=factor_feedback.execution_feedback,
-                    value_feedback=factor_feedback.value_feedback,
-                    gt_implementation=gt_implementation,
-                )
-                (
-                    factor_feedback.final_decision,
-                    factor_feedback.final_feedback,
-                ) = self.final_decision_evaluator.evaluate(
-                    target_task=target_task,
-                    execution_feedback=factor_feedback.execution_feedback,
-                    value_feedback=factor_feedback.value_feedback,
-                    code_feedback=factor_feedback.code_feedback,
-                )
-            return factor_feedback
+        if decision_from_value_check is not None and decision_from_value_check is True:
+            # To avoid confusion, when same_value_or_high_correlation is True, we do not need code feedback
+            factor_feedback.code_feedback = "Final decision is True and there are no code critics."
+            factor_feedback.final_decision = decision_from_value_check
+            factor_feedback.final_feedback = "Value evaluation passed, skip final decision evaluation."
+        elif decision_from_value_check is not None and decision_from_value_check is False:
+            factor_feedback.code_feedback, _ = self.code_evaluator.evaluate(
+                target_task=target_task,
+                implementation=implementation,
+                execution_feedback=factor_feedback.execution_feedback,
+                value_feedback=factor_feedback.value_feedback,
+                gt_implementation=gt_implementation,
+            )
+            factor_feedback.final_decision = decision_from_value_check
+            factor_feedback.final_feedback = "Value evaluation failed, skip final decision evaluation."
+        else:
+            factor_feedback.code_feedback, _ = self.code_evaluator.evaluate(
+                target_task=target_task,
+                implementation=implementation,
+                execution_feedback=factor_feedback.execution_feedback,
+                value_feedback=factor_feedback.value_feedback,
+                gt_implementation=gt_implementation,
+            )
+            (
+                factor_feedback.final_decision,
+                factor_feedback.final_feedback,
+            ) = self.final_decision_evaluator.evaluate(
+                target_task=target_task,
+                execution_feedback=factor_feedback.execution_feedback,
+                value_feedback=factor_feedback.value_feedback,
+                code_feedback=factor_feedback.code_feedback,
+            )
+        factor_feedback.source_feedback.update(
+            {
+                "correctness": factor_feedback.final_decision is True,
+                "schema": gen_df is not None and decision_from_value_check is not False,
+            },
+        )
+        return factor_feedback
 
 
 class FactorPerformanceEvaluator(CoSTEEREvaluator):

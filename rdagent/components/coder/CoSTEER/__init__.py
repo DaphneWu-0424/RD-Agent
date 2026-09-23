@@ -93,6 +93,7 @@ class CoSTEER(Developer[Experiment]):
     def develop(self, exp: Experiment) -> Experiment:
 
         # init intermediate items
+        self.selected_feedback = None
         max_seconds = self.get_develop_max_seconds()
         evo_exp = EvolvingItem.from_experiment(exp)
 
@@ -146,6 +147,7 @@ class CoSTEER(Developer[Experiment]):
                 evo_fb = fallback_evo_fb
             assert evo_fb is not None  # multistep_evolve should run at least once
             evo_exp = self._exp_postprocess_by_feedback(evo_exp, evo_fb)
+            self.selected_feedback = evo_fb
         except CoderError as e:
             e.caused_by_timeout = reached_max_seconds
             raise e

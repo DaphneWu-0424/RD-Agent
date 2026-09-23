@@ -5,13 +5,24 @@ from types import SimpleNamespace
 
 import pandas as pd
 import pytest
-
+from rdagent.components.coder.CoSTEER import CoSTEER
 import rdagent.components.coder.CoSTEER.evaluators as costeer_evaluators
-from rdagent.components.coder.CoSTEER.evaluators import CoSTEERMultiEvaluator, CoSTEERSingleFeedback
+from rdagent.components.coder.CoSTEER.evaluators import (
+    CoSTEERMultiEvaluator,
+    CoSTEERMultiFeedback,
+    CoSTEERSingleFeedback,
+)
+from rdagent.components.coder.factor_coder import FactorCoSTEER
 from rdagent.components.coder.factor_coder.config import FACTOR_COSTEER_SETTINGS
-from rdagent.components.coder.factor_coder.evaluators import FactorPerformanceEvaluator
+from rdagent.components.coder.factor_coder.evaluators import (
+    FactorGateDecision,
+    FactorPerformanceEvaluator,
+    get_factor_gate_decision,
+)
 from rdagent.components.coder.factor_coder.factor import FactorFBWorkspace
 from rdagent.components.coder.factor_coder.profile_data import build_profile_dataset
+from rdagent.scenarios.qlib.developer.factor_runner import QlibFactorRunner
+from rdagent.scenarios.qlib.developer.utils import _build_execute_calls
 
 
 @pytest.fixture
@@ -101,6 +112,142 @@ def test_correctness_and_performance_feedback_merge_to_failure() -> None:
     assert merged.source_feedback["performance"] is False
     # The merged feedback is what the existing evolving trace/RAG path supplies to the next coder round.
     assert "performance failed" in str(merged)
+
+
+def _gate_feedback(performance: bool, message: str = "performance passed") -> CoSTEERSingleFeedback:
+    return CoSTEERSingleFeedback(
+        execution=message,
+        return_checking="schema passed",
+        code=message,
+        final_decision=performance,
+        source_feedback={"correctness": True, "schema": True, "performance": performance},
+    )
+
+
+def test_projected_runtime_failure_grants_smoke_only() -> None:
+    feedback = _gate_feedback(
+        False,
+        "Performance evaluation failed. failure_type=PROJECTED_RUNTIME_EXCEEDED stage=PROJECTION",
+    )
+
+    assert get_factor_gate_decision(feedback) is FactorGateDecision.SMOKE_ONLY
+
+
+def test_functional_or_non_scalability_failure_is_rejected() -> None:
+    functional_failure = _gate_feedback(False, "failure_type=PROJECTED_RUNTIME_EXCEEDED")
+    functional_failure.source_feedback["correctness"] = False
+    execution_failure = _gate_feedback(False, "failure_type=PERFORMANCE_EXECUTION_ERROR")
+
+    assert get_factor_gate_decision(functional_failure) is FactorGateDecision.REJECT
+    assert get_factor_gate_decision(execution_failure) is FactorGateDecision.REJECT
+    assert get_factor_gate_decision(_gate_feedback(True)) is FactorGateDecision.FULL_READY
+
+
+def test_smoke_only_factor_executes_on_profile_but_not_full_sample() -> None:
+    class Workspace:
+        def execute(self, data_type):
+            return data_type
+
+    workspace = Workspace()
+    feedback = _gate_feedback(
+        False,
+        "Performance evaluation failed. failure_type=PROJECTED_RUNTIME_EXCEEDED stage=PROJECTION",
+    )
+    exp = SimpleNamespace(
+        sub_tasks=[object()],
+        sub_workspace_list=[workspace],
+        prop_dev_feedback=CoSTEERMultiFeedback([feedback]),
+    )
+
+    smoke_calls = _build_execute_calls(exp, [], "Profile")
+    full_calls = _build_execute_calls(exp, [], "All")
+
+    assert len(smoke_calls) == 1
+    assert smoke_calls[0][1] == ("Profile",)
+    assert full_calls == []
+
+
+def test_smoke_only_gate_state_marks_original_task_implemented() -> None:
+    task = SimpleNamespace(factor_name="smoke_factor", factor_implementation=False)
+    workspace = object()
+    feedback = CoSTEERMultiFeedback(
+        [
+            _gate_feedback(
+                False,
+                "Performance evaluation failed. failure_type=PROJECTED_RUNTIME_EXCEEDED stage=PROJECTION",
+            ),
+        ],
+    )
+    exp = SimpleNamespace(sub_tasks=[task], sub_workspace_list=[workspace])
+    coder = object.__new__(FactorCoSTEER)
+
+    decisions = coder._apply_gate_state(exp, feedback)
+
+    assert decisions == [FactorGateDecision.SMOKE_ONLY]
+    assert exp.research_mode == "smoke"
+    assert exp.factor_gate_decisions == ["SMOKE_ONLY"]
+    assert exp.sub_workspace_list == [workspace]
+    assert task.factor_implementation is True
+
+
+def test_develop_preserves_falsey_selected_smoke_feedback(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = SimpleNamespace(factor_name="smoke_factor", factor_implementation=False)
+    workspace = object()
+    selected_feedback = CoSTEERMultiFeedback(
+        [
+            _gate_feedback(
+                False,
+                "Performance evaluation failed. failure_type=PROJECTED_RUNTIME_EXCEEDED stage=PROJECTION",
+            ),
+        ],
+    )
+    latest_feedback = CoSTEERMultiFeedback(
+        [_gate_feedback(False, "failure_type=PERFORMANCE_EXECUTION_ERROR")],
+    )
+    exp = SimpleNamespace(sub_tasks=[task], sub_workspace_list=[workspace])
+    coder = object.__new__(FactorCoSTEER)
+    coder.selected_feedback = selected_feedback
+    coder.evolve_agent = SimpleNamespace(evolving_trace=[SimpleNamespace(feedback=latest_feedback)])
+    monkeypatch.setattr(CoSTEER, "develop", lambda self, value: value)
+
+    result = coder.develop(exp)
+
+    assert bool(selected_feedback) is False
+    assert result.prop_dev_feedback is selected_feedback
+    assert result.research_mode == "smoke"
+    assert task.factor_implementation is True
+
+
+def test_rejected_gate_state_does_not_mark_task_implemented() -> None:
+    task = SimpleNamespace(factor_name="broken_factor", factor_implementation=True)
+    feedback = _gate_feedback(False, "failure_type=PERFORMANCE_EXECUTION_ERROR")
+    exp = SimpleNamespace(sub_tasks=[task], sub_workspace_list=[object()])
+    coder = object.__new__(FactorCoSTEER)
+
+    decisions = coder._apply_gate_state(exp, CoSTEERMultiFeedback([feedback]))
+
+    assert decisions == [FactorGateDecision.REJECT]
+    assert exp.research_mode == "rejected"
+    assert task.factor_implementation is False
+
+
+def test_smoke_date_env_uses_profile_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    dates = pd.bdate_range("2020-01-01", periods=20, name="datetime")
+    instruments = pd.Index(["asset_a", "asset_b"], name="instrument")
+    index = pd.MultiIndex.from_product([dates, instruments])
+    pd.DataFrame({"close": 1.0}, index=index).to_hdf(tmp_path / "daily_pv.h5", key="data")
+    monkeypatch.setattr(FACTOR_COSTEER_SETTINGS, "data_folder_profile", str(tmp_path))
+
+    date_env = QlibFactorRunner._smoke_date_env()
+
+    assert date_env == {
+        "train_start": "2020-01-01",
+        "train_end": "2020-01-16",
+        "valid_start": "2020-01-17",
+        "valid_end": "2020-01-22",
+        "test_start": "2020-01-23",
+        "test_end": "2020-01-28",
+    }
 
 
 def test_multi_evaluator_runs_full_chain_in_one_evolve_step(monkeypatch: pytest.MonkeyPatch) -> None:

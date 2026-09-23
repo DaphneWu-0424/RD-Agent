@@ -1,8 +1,7 @@
-from typing import List
 
 import pandas as pd
-
 from rdagent.components.coder.CoSTEER.evaluators import CoSTEERMultiFeedback
+from rdagent.components.coder.factor_coder.evaluators import FactorGateDecision, get_factor_gate_decision
 from rdagent.components.coder.factor_coder.factor import FactorFBWorkspace, FactorTask
 from rdagent.core.conf import RD_AGENT_SETTINGS
 from rdagent.core.exception import FactorEmptyError
@@ -19,25 +18,36 @@ def _build_base_feature_workspaces(exp: QlibFactorExperiment) -> list[FactorFBWo
                 factor_name=file_name,
                 factor_description=f"Base feature from {file_name}",
                 factor_formulation="",
-            )
+            ),
         )
         workspace.inject_files(**{"factor.py": code})
         workspaces.append(workspace)
     return workspaces
 
 
-def _build_execute_calls(exp: QlibFactorExperiment, base_feature_workspaces: list[FactorFBWorkspace]) -> list[tuple]:
+def _build_execute_calls(
+    exp: QlibFactorExperiment,
+    base_feature_workspaces: list[FactorFBWorkspace],
+    data_type: str,
+) -> list[tuple]:
     execute_calls = []
 
     if exp.sub_tasks:
         assert isinstance(exp.prop_dev_feedback, CoSTEERMultiFeedback)
         execute_calls.extend(
-            (implementation.execute, ("All",))
+            (implementation.execute, (data_type,))
             for implementation, feedback in zip(exp.sub_workspace_list, exp.prop_dev_feedback)
-            if implementation and feedback
+            if implementation
+            and (
+                get_factor_gate_decision(feedback) is FactorGateDecision.FULL_READY
+                or (
+                    data_type == "Profile"
+                    and get_factor_gate_decision(feedback) is FactorGateDecision.SMOKE_ONLY
+                )
+            )
         )
 
-    execute_calls.extend((workspace.execute, ("All",)) for workspace in base_feature_workspaces)
+    execute_calls.extend((workspace.execute, (data_type,)) for workspace in base_feature_workspaces)
     return execute_calls
 
 
@@ -54,13 +64,13 @@ def _resolve_index_level_values(df: pd.DataFrame, level_name: str) -> pd.Index |
     if all(first_values.equals(values) for values in candidate_values[1:]):
         logger.warning(
             f"Factor dataframe has duplicated '{level_name}' index levels at positions {matching_levels}; "
-            "their values are identical, so the first one is used."
+            "their values are identical, so the first one is used.",
         )
         return first_values
 
     logger.warning(
         f"Skip factor dataframe because index has ambiguous duplicated '{level_name}' levels at positions "
-        f"{matching_levels}. index names={list(df.index.names)}"
+        f"{matching_levels}. index names={list(df.index.names)}",
     )
     return None
 
@@ -128,7 +138,10 @@ def _process_message_and_df(
     return error_message
 
 
-def process_factor_data(exp_or_list: List[QlibFactorExperiment] | QlibFactorExperiment) -> pd.DataFrame:
+def process_factor_data(
+    exp_or_list: list[QlibFactorExperiment] | QlibFactorExperiment,
+    data_type: str = "All",
+) -> pd.DataFrame:
     """
     Process and combine factor data from experiment implementations.
 
@@ -150,7 +163,7 @@ def process_factor_data(exp_or_list: List[QlibFactorExperiment] | QlibFactorExpe
 
         source_name = exp.hypothesis.concise_justification if exp.hypothesis else "BASE factor files"
         base_feature_workspaces = _build_base_feature_workspaces(exp)
-        execute_calls = _build_execute_calls(exp, base_feature_workspaces)
+        execute_calls = _build_execute_calls(exp, base_feature_workspaces, data_type)
         if not execute_calls:
             continue
 
@@ -165,13 +178,13 @@ def process_factor_data(exp_or_list: List[QlibFactorExperiment] | QlibFactorExpe
         except Exception as concat_error:
             concat_index_info = " | ".join([f"df#{i}: {_format_index_info(df)}" for i, df in enumerate(factor_dfs)])
             logger.warning(
-                f"Failed to concat factor data due to index misalignment. concat_error={concat_error}; collected_index_info={concat_index_info}"
+                f"Failed to concat factor data due to index misalignment. concat_error={concat_error}; collected_index_info={concat_index_info}",
             )
             raise FactorEmptyError(
                 "Failed to concat factor data due to index misalignment or incompatible index structure. "
-                f"concat_error={concat_error}; collected_index_info={concat_index_info}; details={error_message}"
+                f"concat_error={concat_error}; collected_index_info={concat_index_info}; details={error_message}",
             ) from concat_error
     else:
         raise FactorEmptyError(
-            f"No valid factor data found to merge (in process_factor_data) because of {error_message}."
+            f"No valid factor data found to merge (in process_factor_data) because of {error_message}.",
         )
