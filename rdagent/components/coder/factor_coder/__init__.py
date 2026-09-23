@@ -1,7 +1,10 @@
 from rdagent.components.coder.CoSTEER import CoSTEER
 from rdagent.components.coder.CoSTEER.evaluators import CoSTEERMultiEvaluator
 from rdagent.components.coder.factor_coder.config import FACTOR_COSTEER_SETTINGS
-from rdagent.components.coder.factor_coder.evaluators import FactorEvaluatorForCoder
+from rdagent.components.coder.factor_coder.evaluators import (
+    FactorEvaluatorForCoder,
+    FactorPerformanceEvaluator,
+)
 from rdagent.components.coder.factor_coder.evolving_strategy import (
     FactorMultiProcessEvolvingStrategy,
 )
@@ -17,7 +20,11 @@ class FactorCoSTEER(CoSTEER):
         **kwargs,
     ) -> None:
         setting = FACTOR_COSTEER_SETTINGS
-        eva = CoSTEERMultiEvaluator(FactorEvaluatorForCoder(scen=scen), scen=scen)
+        eva = CoSTEERMultiEvaluator(
+            [FactorEvaluatorForCoder(scen=scen), FactorPerformanceEvaluator(scen=scen)],
+            scen=scen,
+            evaluate_all_at_once=True,
+        )
         es = FactorMultiProcessEvolvingStrategy(scen=scen, settings=FACTOR_COSTEER_SETTINGS)
 
         super().__init__(*args, settings=setting, eva=eva, es=es, evolving_version=2, scen=scen, **kwargs)

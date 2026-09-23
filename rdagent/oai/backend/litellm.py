@@ -150,6 +150,10 @@ class LiteLLMAPIBackend(APIBackend):
             logger.info(self._build_log_messages(messages), tag="llm_messages")
 
         complete_kwargs = self.get_complete_kwargs()
+        # Per-call generation settings take precedence over global settings. Pop
+        # them from kwargs so LiteLLM never receives the same keyword twice.
+        if "temperature" in kwargs:
+            complete_kwargs["temperature"] = float(kwargs.pop("temperature"))
         model = complete_kwargs["model"]
 
         response = completion(

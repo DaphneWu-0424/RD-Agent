@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Tuple, Union
@@ -14,6 +15,7 @@ from rdagent.components.coder.factor_coder.config import FACTOR_COSTEER_SETTINGS
 from rdagent.core.exception import CodeFormatError, CustomRuntimeError, NoOutputError
 from rdagent.core.experiment import Experiment, FBWorkspace
 from rdagent.core.utils import cache_with_pickle
+from rdagent.log import rdagent_logger as logger
 from rdagent.oai.llm_utils import md5_hash
 
 
@@ -105,6 +107,39 @@ class FactorFBWorkspace(FBWorkspace):
 
     @cache_with_pickle(hash_func)
     def execute(self, data_type: str = "Debug") -> Tuple[str, pd.DataFrame]:
+        """Execute on Debug/Profile/All data using the normal pickle cache.
+
+        Performance measurements use :meth:`execute_profile`, which deliberately
+        bypasses this decorated method.
+        """
+        return self._execute_impl(data_type=data_type)
+
+    def execute_profile(self) -> Tuple[str, pd.DataFrame]:
+        """Execute against Profile data without the pickle execution cache."""
+        return self._execute_impl(data_type="Profile")
+
+    @staticmethod
+    def _data_folder_and_timeout(data_type: str) -> tuple[Path, int]:
+        mapping = {
+            "Debug": (
+                Path(FACTOR_COSTEER_SETTINGS.data_folder_debug),
+                FACTOR_COSTEER_SETTINGS.file_based_execution_timeout,
+            ),
+            "Profile": (
+                Path(FACTOR_COSTEER_SETTINGS.data_folder_profile),
+                FACTOR_COSTEER_SETTINGS.profile_execution_timeout,
+            ),
+            "All": (
+                Path(FACTOR_COSTEER_SETTINGS.data_folder),
+                FACTOR_COSTEER_SETTINGS.full_execution_timeout,
+            ),
+        }
+        try:
+            return mapping[data_type]
+        except KeyError as exc:
+            raise ValueError(f"Unknown factor execution data_type: {data_type!r}") from exc
+
+    def _execute_impl(self, data_type: str = "Debug") -> Tuple[str, pd.DataFrame]:
         """
         execute the implementation and get the factor value by the following steps:
         1. make the directory in workspace path
@@ -131,18 +166,11 @@ class FactorFBWorkspace(FBWorkspace):
                 return self.FB_CODE_NOT_SET, None
         with FileLock(self.workspace_path / "execution.lock"):
             if self.target_task.version == 1:
-                source_data_path = (
-                    Path(
-                        FACTOR_COSTEER_SETTINGS.data_folder_debug,
-                    )
-                    if data_type == "Debug"  # FIXME: (yx) don't think we should use a debug tag for this.
-                    else Path(
-                        FACTOR_COSTEER_SETTINGS.data_folder,
-                    )
-                )
+                source_data_path, execution_timeout = self._data_folder_and_timeout(data_type)
             elif self.target_task.version == 2:
                 # TODO you can change the name of the data folder for a better understanding
                 source_data_path = Path(KAGGLE_IMPLEMENT_SETTING.local_data_path) / KAGGLE_IMPLEMENT_SETTING.competition
+                execution_timeout = FACTOR_COSTEER_SETTINGS.file_based_execution_timeout
 
             source_data_path.mkdir(exist_ok=True, parents=True)
             code_path = self.workspace_path / f"factor.py"
@@ -160,14 +188,21 @@ class FactorFBWorkspace(FBWorkspace):
                 execution_code_path.write_text((Path(__file__).parent / "factor_execution_template.txt").read_text())
 
             try:
+                factor_name = getattr(self.target_task, "factor_name", self.target_task.name)
+                logger.info(f"[FactorRuntime] stage={data_type.upper()} factor={factor_name} start")
+                started_at = time.perf_counter()
                 subprocess.check_output(
                     f"{FACTOR_COSTEER_SETTINGS.python_bin} {execution_code_path}",
                     shell=True,
                     cwd=self.workspace_path,
                     stderr=subprocess.STDOUT,
-                    timeout=FACTOR_COSTEER_SETTINGS.file_based_execution_timeout,
+                    timeout=execution_timeout,
                 )
                 execution_success = True
+                elapsed = time.perf_counter() - started_at
+                logger.info(
+                    f"[FactorRuntime] stage={data_type.upper()} factor={factor_name} elapsed={elapsed:.2f}s"
+                )
             except subprocess.CalledProcessError as e:
                 import site
 
@@ -184,12 +219,23 @@ class FactorFBWorkspace(FBWorkspace):
                     raise CustomRuntimeError(execution_feedback)
                 else:
                     execution_error = CustomRuntimeError(execution_feedback)
-            except subprocess.TimeoutExpired:
-                execution_feedback += f"Execution timeout error and the timeout is set to {FACTOR_COSTEER_SETTINGS.file_based_execution_timeout} seconds."
+            except subprocess.TimeoutExpired as exc:
+                elapsed = time.perf_counter() - started_at
+                stage = data_type.upper()
+                execution_feedback = (
+                    f"failure_type=PERFORMANCE_TIMEOUT stage={stage} "
+                    f"elapsed={elapsed:.2f}s timeout={execution_timeout}s."
+                )
+                logger.warning(
+                    f"[FactorRuntime] stage={stage} factor={factor_name} TIMEOUT budget={execution_timeout}s"
+                )
                 if self.raise_exception:
-                    raise CustomRuntimeError(execution_feedback)
+                    error = CustomRuntimeError(execution_feedback)
+                    error.caused_by_timeout = True
+                    raise error from exc
                 else:
                     execution_error = CustomRuntimeError(execution_feedback)
+                    execution_error.caused_by_timeout = True
 
             workspace_output_file_path = self.workspace_path / "result.h5"
             if workspace_output_file_path.exists() and execution_success:

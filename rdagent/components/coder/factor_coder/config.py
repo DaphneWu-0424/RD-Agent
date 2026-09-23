@@ -16,11 +16,26 @@ class FactorCoSTEERSettings(CoSTEERSettings):
     data_folder_debug: str = "git_ignore_folder/factor_implementation_source_data_debug"
     """Path to the folder containing partial financial data (for debugging)"""
 
+    data_folder_profile: str = "git_ignore_folder/factor_implementation_source_data_profile"
+    """Path to the representative, medium-sized data used by the performance gate."""
+
     simple_background: bool = False
     """Whether to use simple background information for code feedback"""
 
     file_based_execution_timeout: int = 3600
-    """Timeout in seconds for each factor implementation execution"""
+    """Timeout in seconds for Debug factor implementation execution (kept for compatibility)."""
+
+    profile_execution_timeout: int = 60
+    """Timeout in seconds for an uncached Profile execution."""
+
+    full_execution_timeout: int = 600
+    """Safety timeout in seconds for an All/full-sample execution."""
+
+    projected_full_runtime_budget: float = 300.0
+    """Maximum estimated full-sample runtime accepted by the performance gate."""
+
+    performance_gate_enabled: bool = True
+    """Whether Factor CoSTEER requires the Profile performance gate to pass."""
 
     select_method: str = "random"
     """Method for the selection of factors implementation"""

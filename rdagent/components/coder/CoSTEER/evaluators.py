@@ -253,10 +253,37 @@ class CoSTEEREvaluator(Evaluator):
 class CoSTEERMultiEvaluator(RAGEvaluator):
     """This is for evaluation of experiment. Due to we have multiple tasks, so we will return a list of evaluation feebacks"""
 
-    def __init__(self, single_evaluator: CoSTEEREvaluator | list[CoSTEEREvaluator], scen: "Scenario") -> None:
+    def __init__(
+        self,
+        single_evaluator: CoSTEEREvaluator | list[CoSTEEREvaluator],
+        scen: "Scenario",
+        evaluate_all_at_once: bool = False,
+    ) -> None:
         super().__init__()
         self.scen = scen
         self.single_evaluator = single_evaluator
+        self.evaluate_all_at_once = evaluate_all_at_once
+
+    @staticmethod
+    def _merge_feedback(
+        evo: EvolvingItem,
+        task_li_feedback_li: list[list[CoSTEERSingleFeedback]],
+    ) -> CoSTEERMultiFeedback:
+        merged_task_feedback = []
+        for task_id, feedback in enumerate(task_li_feedback_li[0]):
+            merged_task_feedback.append(
+                feedback.merge([feedback_list[task_id] for feedback_list in task_li_feedback_li]),
+            )
+
+        final_decision = [
+            None if single_feedback is None else single_feedback.final_decision
+            for single_feedback in merged_task_feedback
+        ]
+        logger.info(f"Final decisions: {final_decision} True count: {final_decision.count(True)}")
+        for index in range(len(evo.sub_tasks)):
+            if final_decision[index]:
+                evo.sub_tasks[index].factor_implementation = True
+        return CoSTEERMultiFeedback(merged_task_feedback)
 
     def evaluate_iter(
         self,
@@ -268,6 +295,29 @@ class CoSTEERMultiEvaluator(RAGEvaluator):
         )  # it will receive the evo first, so the first yield is for get the sent evo instead of generate useful feedback
 
         eval_l = self.single_evaluator if isinstance(self.single_evaluator, list) else [self.single_evaluator]
+
+        if self.evaluate_all_at_once:
+            task_li_feedback_li = [
+                multiprocessing_wrapper(
+                    [
+                        (
+                            evaluator.evaluate,
+                            (
+                                evo.sub_tasks[index],
+                                evo.sub_workspace_list[index],
+                                evo.sub_gt_implementations[index] if evo.sub_gt_implementations is not None else None,
+                                queried_knowledge,
+                            ),
+                        )
+                        for index in range(len(evo.sub_tasks))
+                    ],
+                    n=RD_AGENT_SETTINGS.multi_proc_n,
+                )
+                for evaluator in eval_l
+            ]
+            merged_feedback = self._merge_feedback(evo, task_li_feedback_li)
+            yield merged_feedback
+            return merged_feedback
 
         # 1) Evaluate each sub_task
         task_li_feedback_li = []
@@ -303,31 +353,4 @@ class CoSTEERMultiEvaluator(RAGEvaluator):
                 break
             evo = evo_next_iter
 
-        # 2) merge the feedbacks along the sub_tasks to aggregate the multiple evaluation feedbacks
-        merged_task_feedback = []
-        # task_li_feedback_li[0] is a list of feedbacks of different tasks for the 1st evaluator
-        for task_id, fb in enumerate(task_li_feedback_li[0]):
-            fb = fb.merge([fb_li[task_id] for fb_li in task_li_feedback_li])
-            merged_task_feedback.append(fb)
-        # merged_task_feedback: List[CoSTEERSingleFeedback]
-        # Example:
-        # [
-        #   CoSTEERSingleFeedback(final_decision=True, execution="...", return_checking="...", code="..."),
-        #   CoSTEERSingleFeedback(final_decision=False, execution="...", return_checking="...", code="..."),
-        #   ...
-        # ]
-        # Each element corresponds to the merged feedback for one sub-task across all evaluators.
-        # merged_task_feedback[i] is the merged feedback for the i-th sub_task
-
-        final_decision = [
-            None if single_feedback is None else single_feedback.final_decision
-            for single_feedback in merged_task_feedback
-        ]
-        logger.info(f"Final decisions: {final_decision} True count: {final_decision.count(True)}")
-
-        # TODO: this is to be compatible with factor_implementation;
-        for index in range(len(evo.sub_tasks)):
-            if final_decision[index]:
-                evo.sub_tasks[index].factor_implementation = True
-
-        return CoSTEERMultiFeedback(merged_task_feedback)
+        return self._merge_feedback(evo, task_li_feedback_li)

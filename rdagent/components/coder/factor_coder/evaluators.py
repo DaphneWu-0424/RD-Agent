@@ -1,10 +1,14 @@
+import json
 import re
+import time
+from pathlib import Path
 
 from rdagent.components.coder.CoSTEER.evaluators import (
     CoSTEEREvaluator,
     CoSTEERMultiFeedback,
     CoSTEERSingleFeedbackDeprecated,
 )
+from rdagent.components.coder.factor_coder.config import FACTOR_COSTEER_SETTINGS
 from rdagent.components.coder.factor_coder.eva_utils import (
     FactorCodeEvaluator,
     FactorFinalDecisionEvaluator,
@@ -13,6 +17,7 @@ from rdagent.components.coder.factor_coder.eva_utils import (
 from rdagent.components.coder.factor_coder.factor import FactorTask
 from rdagent.core.evolving_framework import QueriedKnowledge
 from rdagent.core.experiment import Workspace
+from rdagent.log import rdagent_logger as logger
 
 FactorSingleFeedback = CoSTEERSingleFeedbackDeprecated
 
@@ -118,6 +123,137 @@ class FactorEvaluatorForCoder(CoSTEEREvaluator):
                     code_feedback=factor_feedback.code_feedback,
                 )
             return factor_feedback
+
+
+class FactorPerformanceEvaluator(CoSTEEREvaluator):
+    """Deterministic wall-clock performance gate for factor implementations."""
+
+    source_tag = "performance"
+
+    @staticmethod
+    def _feedback(message: str, decision: bool, value_generated: bool = False) -> FactorSingleFeedback:
+        return FactorSingleFeedback(
+            execution_feedback=message,
+            value_generated_flag=value_generated,
+            code_feedback=message,
+            value_feedback=message,
+            final_decision=decision,
+            final_feedback=message,
+            final_decision_based_on_gt=False,
+            source_feedback={FactorPerformanceEvaluator.source_tag: decision},
+        )
+
+    def evaluate(
+        self,
+        target_task: FactorTask,
+        implementation: Workspace,
+        gt_implementation: Workspace = None,
+        queried_knowledge: QueriedKnowledge = None,
+        **kwargs,
+    ) -> FactorSingleFeedback:
+        if implementation is None:
+            return self._feedback(
+                "Performance evaluation failed. failure_type=PERFORMANCE_NO_IMPLEMENTATION stage=PROFILE",
+                False,
+            )
+
+        if not FACTOR_COSTEER_SETTINGS.performance_gate_enabled:
+            return self._feedback("Performance evaluation PASS (performance gate disabled).", True)
+
+        profile_folder = Path(FACTOR_COSTEER_SETTINGS.data_folder_profile)
+        metadata_path = profile_folder / "profile_meta.json"
+        if not profile_folder.is_dir() or not metadata_path.is_file():
+            return self._feedback(
+                "Performance evaluation failed. failure_type=PROFILE_DATA_MISSING stage=PROFILE. "
+                "Profile dataset is missing; run the profile data builder.",
+                False,
+            )
+
+        started_at = time.perf_counter()
+        try:
+            execution_feedback, generated = implementation.execute_profile()
+        except Exception as exc:
+            runtime = time.perf_counter() - started_at
+            message = (
+                "Performance evaluation failed. failure_type=PERFORMANCE_EXECUTION_ERROR stage=PROFILE "
+                f"runtime={runtime:.2f}s error={exc}"
+            )
+            return self._feedback(message, False)
+        runtime = time.perf_counter() - started_at
+
+        if (
+            runtime > FACTOR_COSTEER_SETTINGS.profile_execution_timeout
+            or "failure_type=PERFORMANCE_TIMEOUT" in execution_feedback
+        ):
+            message = (
+                "Performance evaluation failed.\n\n"
+                "failure_type=PERFORMANCE_TIMEOUT\n"
+                "stage=PROFILE\n"
+                f"runtime={runtime:.2f}s\n"
+                f"timeout={FACTOR_COSTEER_SETTINGS.profile_execution_timeout}s\n\n"
+                f"Execution feedback: {execution_feedback}"
+            )
+            return self._feedback(message, False)
+        if generated is None:
+            message = (
+                "Performance evaluation failed. failure_type=PERFORMANCE_EXECUTION_ERROR stage=PROFILE\n"
+                f"Measured profile runtime: {runtime:.2f} seconds\n"
+                f"Execution feedback: {execution_feedback}"
+            )
+            return self._feedback(message, False)
+
+        try:
+            metadata = json.loads(metadata_path.read_text())
+            profile_rows = int(metadata["profile_rows"])
+            full_rows = int(metadata["full_rows"])
+            if profile_rows <= 0 or full_rows <= 0:
+                raise ValueError("row counts must be positive")
+            scale_ratio = full_rows / profile_rows
+            instrument_count = int(metadata["instrument_count"])
+            date_count = int(metadata["date_count"])
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            return self._feedback(
+                "Performance evaluation failed. failure_type=PROFILE_METADATA_INVALID stage=PROFILE "
+                f"error={exc}",
+                False,
+            )
+
+        projected_runtime = runtime * scale_ratio
+        budget = FACTOR_COSTEER_SETTINGS.projected_full_runtime_budget
+        decision = projected_runtime <= budget
+        factor_name = getattr(target_task, "factor_name", target_task.name)
+        logger.info(
+            f"[FactorRuntime] stage=PROFILE factor={factor_name} projected_full={projected_runtime:.2f}s "
+            f"{'PASS' if decision else 'FAIL'}",
+        )
+        outcome = "PASS" if decision else "failed"
+        guidance = ""
+        if not decision:
+            guidance = (
+                "\n\nThe implementation appears functionally valid but is too expensive for full-sample execution. "
+                "Preserve the factor definition and output schema, but optimize the implementation. "
+                "Reduce Python-level repeated work, repeated object construction, unnecessary I/O, "
+                "or avoidable per-window overhead where possible. Do not change the mathematical "
+                "definition merely to pass the performance test."
+            )
+        failure_type = "" if decision else "failure_type=PROJECTED_RUNTIME_EXCEEDED\n"
+        message = (
+            f"Performance evaluation {outcome}.\n\n"
+            f"{failure_type}"
+            "stage=PROFILE\n"
+            "estimated=true\n"
+            f"profile_runtime_seconds={runtime:.2f}\n"
+            f"profile_rows={profile_rows}\n"
+            f"full_rows={full_rows}\n"
+            f"scale_ratio={scale_ratio:.6f}\n"
+            f"instrument_count={instrument_count}\n"
+            f"date_count={date_count}\n"
+            f"projected_full_runtime_seconds={projected_runtime:.2f}\n"
+            f"projected_full_runtime_budget_seconds={budget:.2f}\n\n"
+            "The full-runtime projection is a linear heuristic."
+            f"{guidance}"
+        )
+        return self._feedback(message, decision, value_generated=True)
 
 
 # TODO:

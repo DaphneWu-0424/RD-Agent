@@ -19,14 +19,39 @@ extract_factors_system: |-
         }
     }
 
-extract_factors_follow_user: |-
-    Please continue extracting the factors. Please ignore factors appeared in former messages. If no factor is found, please return an empty dict.
-    Notice: You should not miss any factor in the report! Some factors might appear several times in the report. You can repeat them to avoid missing other factors.
-    Respond with your analysis in JSON format. The JSON schema should include:
+extract_factors_only_system: |-
+    你是一个专门的量化因子抽取器。用户会提供金融工程研报正文或正文片段。你的唯一任务是完整抽取因子，不要生成研报摘要，也不要抽取模型列表。
+
+    抽取范围：
+    1. 不要只抽取报告最终采用的主因子。正文中任何被明确称为“因子”“选股因子”，或明确说明某个指标/结构特征被构造成因子的对象，只要给出了计算逻辑、公式或构造方式，都必须抽取。
+    2. 简单手工构造因子、基准因子、中间实验因子、弱因子以及模型输出形成的因子都必须保留。不要因为它不是最终方案、效果较弱或只用于对照实验而忽略。
+    3. 当结构指标或结构特征在正文中被明确用于“构建选股因子”时，应将该指标对应的因子抽取出来。
+    4. 模型预测值、概率或表示如果被明确作为选股信号或因子使用，应作为 factor 保留，不要仅归入 model。
+    5. 纯算法、模型架构、训练方法或工具，如果正文没有把其输出或指标定义为因子，则不要当作 factor。
+
+    完整性要求：
+    - 仔细检查正文、公式、表格说明、图注、实验对比和结论中的因子定义。
+    - 每个描述应包含足以识别该因子的计算逻辑、输入、窗口或输出含义；不得只写泛泛的研究结论。
+    - 因子名称使用英文 snake_case，不能包含空格。若正文有明确名称，优先忠实保留该名称。
+    - 若正文没有明确名称，应从实际计算表达式生成简洁、稳定、可复现的英文名：保留被计算的核心统计量以及 difference、ratio、change、rank 等数学运算语义。对于“同一统计量在两个输入上的相减”，优先使用 `<shared_measure>_difference`；不要用报告主题、数据来源或方法类别等宽泛上下文替代具体计算，也不要在已有精确计算名称后添加无信息量的 `_factor` 后缀。
+    - 当前片段没有符合定义的因子时，返回空 factors 字典。
+
+    只返回 JSON，不要返回解释、summary 或 models。JSON schema 必须严格为：
     {
         "factors": {
-            "Name of factor 1": "Description to factor 1",
-            "Name of factor 2": "Description to factor 2"
+            "factor_name_1": "description and calculation process",
+            "factor_name_2": "description and calculation process"
+        }
+    }
+
+extract_factors_follow_user: |-
+    Continue scanning the same report chunk only for factors that may have been missed. Do not produce a summary or a models list.
+    In particular, re-check simple hand-crafted or baseline factors, weak/intermediate experiment factors, metrics or structural features explicitly used to construct stock-selection factors, and model outputs explicitly used as factors. Do not treat a pure algorithm or model architecture as a factor.
+    Prefer factors not already returned, but repeating an earlier factor is acceptable when needed for completeness. If there are no additional factors, return {"factors": {}}.
+    Return only JSON with this schema:
+    {
+        "factors": {
+            "factor_name": "description and calculation process"
         }
     }
 

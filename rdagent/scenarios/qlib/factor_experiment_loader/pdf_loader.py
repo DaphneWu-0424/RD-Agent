@@ -114,70 +114,179 @@ def classify_report_from_dict(
 
 def __extract_factors_name_and_desc_from_content(
     content: str,
-) -> dict[str, dict[str, str]]:
-    session = APIBackend().build_chat_session(
-        session_system_prompt=T(".prompts:extract_factors_system").r(),
+) -> dict[str, str]:
+    """
+    Extract factors from a long report chunk by chunk while preserving
+    the original multi-turn "continue extraction" behavior.
+    """
+    system_prompt = T(".prompts:extract_factors_only_system").r()
+
+    chunk_size = 12000
+    overlap = 1200
+
+    chunks = []
+    start_idx = 0
+
+    while start_idx < len(content):
+        end_idx = min(start_idx + chunk_size, len(content))
+        chunks.append(content[start_idx:end_idx])
+
+        if end_idx >= len(content):
+            break
+
+        start_idx = end_idx - overlap
+
+    logger.info(
+        f"Split report into {len(chunks)} chunks for factor extraction"
     )
 
     extracted_factor_dict = {}
-    current_user_prompt = content
 
-    for _ in range(10):
-        extract_result_resp = session.build_chat_completion(
-            user_prompt=current_user_prompt,
-            json_mode=True,
+    for chunk_idx, chunk in enumerate(chunks, start=1):
+        logger.info(
+            f"Extracting factors from report chunk "
+            f"{chunk_idx}/{len(chunks)}"
         )
-        ret_dict = json.loads(extract_result_resp)
-        factors = ret_dict["factors"]
-        if len(factors) == 0:
-            break
-        for factor_name, factor_description in factors.items():
-            extracted_factor_dict[factor_name] = factor_description
-        current_user_prompt = T(".prompts:extract_factors_follow_user").r()
+
+        session = APIBackend().build_chat_session(
+            session_system_prompt=system_prompt,
+        )
+
+        current_user_prompt = chunk
+
+        # Preserve RD-Agent's original iterative extraction behavior.
+        for round_idx in range(5):
+            logger.info(
+                f"Factor extraction chunk {chunk_idx}/{len(chunks)}, "
+                f"round {round_idx + 1}/5"
+            )
+
+            extract_result_resp = session.build_chat_completion(
+                user_prompt=current_user_prompt,
+                json_mode=True,
+                temperature=0.0,
+            )
+
+            ret_dict = json.loads(extract_result_resp)
+            factors = ret_dict.get("factors", {})
+
+            if not isinstance(factors, dict) or len(factors) == 0:
+                break
+
+            new_factor_count = 0
+
+            for factor_name, factor_description in factors.items():
+                if factor_name not in extracted_factor_dict:
+                    new_factor_count += 1
+
+                extracted_factor_dict[factor_name] = factor_description
+
+            logger.info(
+                f"Chunk {chunk_idx} round {round_idx + 1}: "
+                f"got {len(factors)} factors, "
+                f"{new_factor_count} new"
+            )
+
+            current_user_prompt = T(
+                ".prompts:extract_factors_follow_user"
+            ).r()
+
+    logger.info(
+        f"Extracted {len(extracted_factor_dict)} unique factors "
+        f"from {len(chunks)} chunks"
+    )
 
     return extracted_factor_dict
-
 
 def __extract_factors_formulation_from_content(
     content: str,
     factor_dict: dict[str, str],
 ) -> dict[str, dict[str, str]]:
+    """
+    Extract factor formulations in small batches.
+
+    A factor-dense report can contain dozens or hundreds of factors.
+    Sending all factors together may cause the LLM response to hit the
+    output-token limit repeatedly. Process a small number of factors
+    per request instead.
+    """
     factor_dict_df = pd.DataFrame(
         factor_dict.items(),
         columns=["factor_name", "factor_description"],
     )
 
-    system_prompt = T(".prompts:extract_factor_formulation_system").r()
-    current_user_prompt = T(".prompts:extract_factor_formulation_user").r(
-        report_content=content,
-        factor_dict=factor_dict_df.to_string(),
-    )
+    system_prompt = T(
+        ".prompts:extract_factor_formulation_system"
+    ).r()
 
-    session = APIBackend().build_chat_session(session_system_prompt=system_prompt)
     factor_to_formulation = {}
 
-    for _ in range(10):
-        extract_result_resp = session.build_chat_completion(
-            user_prompt=current_user_prompt,
-            json_mode=True,
+    # Keep each response comfortably below the model output limit.
+    batch_size = 12
+
+    for start_idx in range(0, len(factor_dict_df), batch_size):
+        batch_df = factor_dict_df.iloc[
+            start_idx : start_idx + batch_size
+        ].copy()
+
+        batch_names = set(batch_df["factor_name"])
+
+        current_user_prompt = T(
+            ".prompts:extract_factor_formulation_user"
+        ).r(
+            report_content=content,
+            factor_dict=batch_df.to_string(index=False),
         )
-        ret_dict = json.loads(extract_result_resp)
-        for name, formulation_and_description in ret_dict.items():
-            if name in factor_dict:
-                factor_to_formulation[name] = formulation_and_description
-        if len(factor_to_formulation) != len(factor_dict):
-            remain_df = factor_dict_df[~factor_dict_df["factor_name"].isin(factor_to_formulation)]
-            current_user_prompt = (
-                "Some factors are missing. Please check the following"
-                " factors and their descriptions and continue extraction.\n"
-                "==========================Remaining factors"
-                "==========================\n" + remain_df.to_string()
+
+        session = APIBackend().build_chat_session(
+            session_system_prompt=system_prompt
+        )
+
+        batch_result = {}
+
+        # Retry only missing factors inside this batch.
+        for _ in range(5):
+            extract_result_resp = session.build_chat_completion(
+                user_prompt=current_user_prompt,
+                json_mode=True,
             )
-        else:
-            break
+
+            ret_dict = json.loads(extract_result_resp)
+
+            for name, formulation_and_description in ret_dict.items():
+                if name in batch_names:
+                    batch_result[name] = formulation_and_description
+
+            missing_names = [
+                name
+                for name in batch_names
+                if name not in batch_result
+            ]
+
+            if not missing_names:
+                break
+
+            remain_df = batch_df[
+                batch_df["factor_name"].isin(missing_names)
+            ]
+
+            current_user_prompt = (
+                "Some factors are missing. Please extract only the "
+                "following factors and return their formulations and "
+                "variables in JSON format.\n"
+                "================ Remaining factors ================\n"
+                + remain_df.to_string(index=False)
+            )
+
+        factor_to_formulation.update(batch_result)
+
+        logger.info(
+            f"Factor formulation extraction progress: "
+            f"{min(start_idx + batch_size, len(factor_dict_df))}/"
+            f"{len(factor_dict_df)}"
+        )
 
     return factor_to_formulation
-
 
 def __extract_factor_and_formulation_from_one_report(
     content: str,
